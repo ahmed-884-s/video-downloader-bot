@@ -19,7 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+COOKIES_PATH = Path("/tmp/cookies.txt")
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
 URL_PATTERN = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^\s]*)?')
@@ -29,6 +30,28 @@ SUPPORTED_SITES = (
     "Vimeo • Dailymotion • Reddit • Twitch • and 1,000+ more"
 )
 
+# ── Write cookies from env variable on startup ─────────────────────────────
+def setup_cookies():
+    content = os.getenv("COOKIES_CONTENT", "").strip()
+    if content:
+        COOKIES_PATH.write_text(content)
+        logger.info("Cookies loaded from environment variable.")
+    else:
+        logger.warning("No COOKIES_CONTENT env variable found — some YouTube videos may fail.")
+
+def get_ydl_opts(extra: dict = None) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+    if COOKIES_PATH.exists():
+        opts["cookiefile"] = str(COOKIES_PATH)
+    if extra:
+        opts.update(extra)
+    return opts
+
+# ── Helpers ────────────────────────────────────────────────────────────────
 def is_url(text):
     return bool(URL_PATTERN.match(text.strip()))
 
@@ -49,8 +72,7 @@ def format_size(bytes_):
     return f"{bytes_:.1f} GB"
 
 def get_video_info(url):
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
         return ydl.extract_info(url, download=False)
 
 def build_format_list(formats):
@@ -70,6 +92,7 @@ def build_format_list(formats):
         })
     return sorted(result, key=lambda x: x["height"], reverse=True)[:5]
 
+# ── Commands ───────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name or "there"
     await update.message.reply_text(
@@ -90,8 +113,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Choose your preferred quality or extract audio only.\n"
         "4. Your file will be sent directly to this chat.\n\n"
         "⚙️ *Commands*\n"
-        "/start — Welcome message\n"
-        "/help  — This help page\n\n"
+        "/start  — Welcome message\n"
+        "/help   — This help page\n"
+        "/status — Check bot status & cookies\n\n"
         "⚠️ *Limitations*\n"
         "• Maximum file size: 50 MB (Telegram limit)\n"
         "• Private or DRM-protected videos cannot be downloaded\n"
@@ -99,6 +123,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cookies_ok = "✅ Loaded" if COOKIES_PATH.exists() else "❌ Not set — some YouTube videos may fail"
+    await update.message.reply_text(
+        f"🤖 *Bot Status*\n\n"
+        f"🍪 YouTube Cookies: {cookies_ok}\n"
+        f"📦 yt-dlp: ready\n"
+        f"🟢 Status: online",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+# ── URL handler ────────────────────────────────────────────────────────────
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
@@ -129,7 +164,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not video_formats and not has_audio:
             await status.edit_text(
-                "❌ No downloadable formats were found for this URL.\n"
+                "❌ No downloadable formats found.\n"
                 "The video may be private, region-locked, or from an unsupported source."
             )
             return
@@ -165,9 +200,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif "not available" in err or "unavailable" in err:
             msg = "🌍 This video is not available in your region or has been removed."
         elif "unsupported url" in err:
-            msg = "❌ This platform is not supported.\nTry a link from YouTube, TikTok, Instagram, or similar."
-        elif "sign in" in err or "login" in err:
-            msg = "🔐 This video requires a login and cannot be downloaded."
+            msg = "❌ This platform is not supported.\nTry YouTube, TikTok, Instagram, or similar."
+        elif "sign in" in err or "login" in err or "confirm" in err:
+            msg = (
+                "🔐 *YouTube requires authentication for this video.*\n\n"
+                "The bot admin needs to set up YouTube cookies.\n"
+                "Type /status to check cookie status."
+            )
         else:
             msg = f"❌ Download failed.\n\n`{str(e)[:250]}`"
         await status.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -179,6 +218,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
 
+# ── Download & send ────────────────────────────────────────────────────────
 async def download_and_send(update, context, url, title, format_id=None, audio_only=False):
     query = update.callback_query
     await query.edit_message_text("⬇️ Downloading… this may take a moment.")
@@ -187,12 +227,9 @@ async def download_and_send(update, context, url, title, format_id=None, audio_o
         output_tmpl = str(Path(tmpdir) / "%(title)s.%(ext)s")
 
         if audio_only:
-            ydl_opts = {
+            extra = {
                 "format": "bestaudio/best",
                 "outtmpl": output_tmpl,
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
                 "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
@@ -200,14 +237,17 @@ async def download_and_send(update, context, url, title, format_id=None, audio_o
                 }],
             }
         else:
-            ydl_opts = {
-                "format": f"{format_id}+bestaudio/best" if format_id else "bestvideo+bestaudio/best",
+            extra = {
+                "format": (
+                    f"{format_id}+bestaudio[ext=m4a]/bestaudio/best"
+                    if format_id else
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                ),
                 "outtmpl": output_tmpl,
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
                 "merge_output_format": "mp4",
             }
+
+        ydl_opts = get_ydl_opts(extra)
 
         try:
             def do_download():
@@ -218,7 +258,7 @@ async def download_and_send(update, context, url, title, format_id=None, audio_o
 
             files = list(Path(tmpdir).glob("*"))
             if not files:
-                await query.edit_message_text("❌ Download failed — no output file was produced.")
+                await query.edit_message_text("❌ Download failed — no output file produced.")
                 return
 
             file_path = files[0]
@@ -227,7 +267,7 @@ async def download_and_send(update, context, url, title, format_id=None, audio_o
             if file_size > MAX_FILE_SIZE:
                 await query.edit_message_text(
                     "⚠️ *File too large*\n\n"
-                    f"The file is `{format_size(file_size)}`, which exceeds Telegram's 50 MB upload limit.\n"
+                    f"The file is `{format_size(file_size)}`, exceeding Telegram's 50 MB limit.\n"
                     "Please choose a lower quality and try again.",
                     parse_mode=ParseMode.MARKDOWN,
                 )
@@ -262,12 +302,13 @@ async def download_and_send(update, context, url, title, format_id=None, audio_o
             )
 
         except Exception as e:
-            logger.exception("Error during download_and_send")
+            logger.exception("Error in download_and_send")
             await query.edit_message_text(
-                f"❌ An error occurred during download.\n\n`{str(e)[:200]}`",
+                f"❌ Download error.\n\n`{str(e)[:200]}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
 
+# ── Callback router ────────────────────────────────────────────────────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -279,24 +320,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cancel":
         await query.edit_message_text("✖ Cancelled.")
         return
-
     if not url:
         await query.edit_message_text("⚠️ Session expired. Please send the URL again.")
         return
-
     if data == "dl_audio":
         await download_and_send(update, context, url, title, audio_only=True)
     elif data.startswith("dl_video_"):
-        fmt_id = data[len("dl_video_"):]
-        await download_and_send(update, context, url, title, format_id=fmt_id)
+        await download_and_send(update, context, url, title, format_id=data[len("dl_video_"):])
 
+# ── Entry point ────────────────────────────────────────────────────────────
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
+    setup_cookies()
+
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
